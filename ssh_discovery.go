@@ -174,8 +174,13 @@ func resolveSSHIdentityPath(value, home, alias, hostName, user, port string) (st
 	if err := withinRoot(home, absolute); err != nil {
 		return "", fmt.Errorf("%w: SSH IdentityFile is outside the user home directory", ErrUnsupported)
 	}
+	// Resolve both roots before comparing so Windows junctions do not look like escapes.
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return "", fmt.Errorf("%w: cannot resolve SSH user home directory", ErrUnsupported)
+	}
 	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
-		if err := withinRoot(home, resolved); err != nil {
+		if err := withinRoot(resolvedHome, resolved); err != nil {
 			return "", fmt.Errorf("%w: SSH IdentityFile symlink leaves the user home directory", ErrUnsupported)
 		}
 		absolute = resolved

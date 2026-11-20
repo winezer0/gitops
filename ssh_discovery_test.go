@@ -70,6 +70,32 @@ func TestLocalSSHDiscoveryResolvesAliasAndMultipleIdentityFiles(t *testing.T) {
 	}
 }
 
+func TestResolveSSHIdentityPathAllowsSymlinkedHome(t *testing.T) {
+	realHome := t.TempDir()
+	identityPath := createSSHIdentityFile(t, filepath.Join(realHome, "id_ed25519"))
+	linkParent := t.TempDir()
+	homeAlias := filepath.Join(linkParent, "home")
+	if err := os.Symlink(realHome, homeAlias); err != nil {
+		t.Skipf("directory symlinks are unavailable: %v", err)
+	}
+
+	resolved, err := resolveSSHIdentityPath(filepath.Join(homeAlias, "id_ed25519"), homeAlias, "alias", "host", "user", "22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityInfo, err := os.Stat(identityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(resolvedInfo, identityInfo) {
+		t.Fatalf("resolved identity = %q, want file %q", resolved, identityPath)
+	}
+}
+
 func TestSSHDiscoveryIsOptInAndRevalidatesAliasTarget(t *testing.T) {
 	home, sshDirectory := prepareSSHHome(t)
 	if err := os.WriteFile(filepath.Join(sshDirectory, "config"), []byte("Host git-alias\n HostName target.example.test\n IdentityFile ~/.ssh/id_test\n"), 0o600); err != nil {
