@@ -1,6 +1,8 @@
 # GitOps
 
-GitOps 是一个结构化的 Go Git 工具包，用于探测和克隆 HTTPS、SSH Git 仓库。
+[English](README.en.md)
+
+GitOps 是一个 Go 工具包，用于在应用内受控地探测、克隆和校验 HTTPS、SSH Git 仓库。它提供远程引用解析、限额克隆、工作区校验和凭证检查；凭证存储及主机/DNS 安全策略由调用方提供。
 
 ## 功能
 
@@ -12,7 +14,7 @@ GitOps 提供以下操作：
 - `Client.Checkout`：切换到指定分支、标签或提交。
 - `Client.ValidateCheckout`：校验本地工作区的远程地址、提交和干净状态。
 - `Client.TestCredential`：检查凭证是否具有指定仓库的读取权限。
-- `Client.TestHostCredential`：独立检查服务商账号凭证或 SSH 凭证。
+- `Client.TestHostCredential`：HTTPS 支持 GitHub、GitLab、Gitea 和自定义 HTTPS 用户 API；SSH 通过严格校验主机密钥的握手检查密钥。
 
 `TestCredential` 检查凭证是否能访问指定仓库。`TestHostCredential` 不依赖仓库路径：HTTPS 凭证通过相应服务商的用户 API 验证；SSH 凭证通过启用严格主机密钥校验的 Go SSH 握手验证。结果分别提供 `CredentialStatus` 和 `ProfileAccess`，区分令牌是否被接受与用户资料是否可读。检查未通过时，方法会同时返回结果和 `*CredentialTestError`；通过 `Diagnostic.Code` 查看具体原因。用户资料 API 验证不代表凭证有权访问某个私有仓库；如需确认仓库权限，请使用 `Probe` 或 `TestCredential`。
 
@@ -37,6 +39,8 @@ log.Printf("credential=%s profile_access=%s", result.CredentialStatus, result.Pr
 
 ## 快速开始
 
+以下片段假定写在返回 `error` 的调用方函数中；`ctx`、`repositoryURL`、`credentials` 和 `ssrfPolicy` 由应用提供。示例使用仓库级凭证回调，并假设已导入 `fmt` 和 `github.com/winezer0/gitops`。
+
 ```go
 client, err := gitops.NewClient(gitops.Config{
     AllowedHosts: []string{"github.com", "git.example.org"},
@@ -52,8 +56,11 @@ if err != nil {
 
 result, err := client.Probe(ctx, gitops.ProbeRequest{
     URL: repositoryURL, Ref: "main",
-    Credential: &gitops.Credential{Username: "git", Token: token},
 })
+if err != nil {
+    return err
+}
+fmt.Printf("resolved commit: %s\n", result.ResolvedCommit)
 ```
 
 ## 凭证和安全
@@ -68,7 +75,7 @@ Go 引擎默认验证 HTTPS 证书，并要求显式配置 SSH 主机密钥信�
 
 ## 克隆行为
 
-每次操作受 `Config.Timeout` 和调用方的 `context.Context` 共同限制。默认浅克隆深度为 1，默认工作区大小上限为 5 GiB（`MaxCloneBytes`）。克隆目标目录必须不存在，除非设置 `ReplaceExisting`。`ReusePinned` 只会复用与指定固定提交匹配且状态干净的工作区。`DestinationRoot` 可将克隆路径限制在指定目录内。结果会标明实际执行引擎。
+网络探测、克隆、凭证检查和引用切换使用调用方的 `context.Context`，并遵守请求或客户端超时。本地 `ValidateCheckout` 是同步检查，不接收 context。默认浅克隆深度为 1，默认工作区大小上限为 5 GiB（`MaxCloneBytes`）。克隆目标目录必须不存在，除非设置 `ReplaceExisting`。`ReusePinned` 只会复用与指定固定提交匹配且状态干净的工作区。`DestinationRoot` 可将克隆路径限制在指定目录内。结果会标明实际执行引擎。
 
 `SparsePaths` 指定相对于仓库根目录的目录，例如 `[]string{"cmd", "internal/source"}`。Go 引擎只会在工作区物化选中的目录；当前 go-git 传输仍可能下载其他路径对应的仓库对象。路径列表为空时检出完整仓库。
 
@@ -76,17 +83,20 @@ Go 引擎默认验证 HTTPS 证书，并要求显式配置 SSH 主机密钥信�
 
 固定提交会在请求的浅克隆深度内获取。若该深度内没有目标提交，克隆返回 `ErrCommitUnavailableAtDepth`，不会静默下载完整历史。
 
-## 执行引擎
+## 传输支持
 
-GitOps 对 HTTPS 使用 go-git，对 SSH 使用进程内 Go SSH 传输。运行时不调用 system Git、OpenSSH 或 processkit。认证、主机校验、引用解析、网络、超时和取消错误会直接返回，不会通过其他引擎重试。
+| 协议 | 引擎 | 凭证 | 服务端校验 |
+| --- | --- | --- | --- |
+| HTTPS | go-git | 用户名和 Token/密码 | 默认验证 TLS 证书 |
+| SSH | 进程内 Go SSH | 私钥字节或路径，可选口令 | 严格验证 `known_hosts` 或应用回调 |
 
-GitOps 不会在认证失败时自动换引擎重试。这样可以避免凭证、主机校验或仓库权限问题被其他引擎掩盖。
+运行时不调用 system Git、OpenSSH 或 processkit。认证、主机校验、引用解析、网络、超时和取消错误会直接返回，不会通过其他引擎重试，避免掩盖凭证、主机校验或仓库权限问题。
 
 ## 进度、诊断和任务日志
 
-`ProbeRequest`、`CloneRequest` 和 `CredentialTestRequest` 可通过 `OnEvent` 接收结构化进度和安全诊断事件。任务日志的持久化和面向用户的格式由调用方负责。
+`ProbeRequest`、`CloneRequest` 和 `CredentialTestRequest` 可通过 `OnEvent` 接收结构化进度和安全诊断事件。`CloneRequest.OnProgress` 还会提供引擎、阶段、百分比、已接收/总对象数和接收字节数。任务日志的持久化和面向用户的格式由调用方负责。
 
-`OperationError.Error()` 和 `Diagnostic` 不包含原始进程输出或凭证。服务商 API 路由与认证检查由 GitOps 实现；凭证的保存和查找由调用方负责。`ProgressEvent` 仅提供引擎、阶段和百分比；`ErrorCode` 返回稳定且经过脱敏的错误类别。
+错误消息和 `Diagnostic` 不包含原始进程输出或凭证。服务商 API 路由与认证检查由 GitOps 实现；凭证的保存和查找由调用方负责。`ErrorCode` 返回稳定且经过脱敏的错误分类。
 
 ```go
 result, err := client.Clone(ctx, gitops.CloneRequest{
@@ -103,10 +113,6 @@ result, err := client.Clone(ctx, gitops.CloneRequest{
 })
 ```
 
-## 兼容性矩阵
-
-此前记录的服务商结果使用 system Git 或 Git Credential Manager，不能作为 v0.0.2 Go 运行路径的验证结果。请使用下方的可选外部兼容性测试，并仅访问获授权的仓库。
-
 ## 本地验证
 
 ```sh
@@ -118,6 +124,8 @@ go vet ./...
 
 ## 可选的外部兼容性测试
 
-可通过以下环境变量提供测试仓库：`GITOPS_TEST_GITHUB_URL`、`GITOPS_TEST_GITLAB_URL`、`GITOPS_TEST_GITEA_URL`、`GITOPS_TEST_GITEE_URL` 或 `GITOPS_TEST_PRIVATE_URL`。每个变量可配套 `_REF`、`_USERNAME`、`_TOKEN`、`_PASSWORD` 和 `_SSH_KEY_FILE`。私有凭证应通过获批的密钥存储或 CI 密钥注入提供；测试只报告脱敏后的错误类别。测试会探测并克隆仓库、比较解析出的提交；每个用例的超时为 45 秒。未配置仓库时会跳过。
+可通过以下环境变量提供测试仓库：`GITOPS_TEST_GITHUB_URL`、`GITOPS_TEST_GITLAB_URL`、`GITOPS_TEST_GITEA_URL`、`GITOPS_TEST_GITEE_URL` 或 `GITOPS_TEST_PRIVATE_URL`。每个变量可配套 `_REF`、`_USERNAME`、`_TOKEN`、`_PASSWORD` 和 `_SSH_KEY_FILE`。私有凭证应通过获批的密钥存储或 CI 密钥注入提供；测试只报告脱敏后的错误类别。默认测试会探测并克隆仓库、比较解析出的提交；每个用例的超时为 45 秒。未配置仓库时会跳过。
 
-SSH 测试可将 `GITOPS_TEST_PRIVATE_URL` 设为 SSH 克隆地址，例如 `git@git.example.org:team/repo.git`，并提供私钥或在客户端配置中显式启用 `DiscoverSSHKeys`。主机密钥校验始终严格；未知主机密钥应通过可信流程加入已配置的信任源。
+私有仓库还可启用额外用例：`GITOPS_TEST_PRIVATE_REF_MATRIX=1` 测试默认引用、分支、标签和提交；`GITOPS_TEST_PRIVATE_NEGATIVE=1` 测试缺失/错误凭证和引用等失败路径；`GITOPS_TEST_PRIVATE_USER_API=1` 测试 GitLab 用户资料 API，并在该用例中跳过仓库探测和克隆。引用矩阵的超时为 2 分钟。
+
+SSH 测试可将 `GITOPS_TEST_PRIVATE_URL` 设为 SSH 克隆地址，例如 `git@git.example.org:team/repo.git`，并提供私钥文件。`GITOPS_TEST_SSH_DISCOVERY=1` 可启用本机 SSH 密钥发现，`GITOPS_TEST_SSH_USER_KNOWN_HOSTS=1` 可启用用户 `known_hosts`。主机密钥校验始终严格；未知主机密钥应通过可信流程加入已配置的信任源。
