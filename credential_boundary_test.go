@@ -15,8 +15,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -53,7 +51,7 @@ func TestHTTPSRedirectDoesNotForwardCredentialsToAnotherHost(t *testing.T) {
 		http.Redirect(writer, request, redirectTarget.String(), http.StatusFound)
 	}))
 	defer origin.Close()
-	configureLocalGitHTTPS(t, certificatePEM)
+	disableHTTPProxyEnvironment(t)
 
 	url := strings.TrimSuffix(origin.URL, "/") + "/team/private.git"
 	repository, err := ParseURL(url)
@@ -63,6 +61,7 @@ func TestHTTPSRedirectDoesNotForwardCredentialsToAnotherHost(t *testing.T) {
 	credentialCalls := atomic.Int32{}
 	client, err := NewClient(Config{
 		AllowedHosts: []string{repository.Host},
+		CABundle:     certificatePEM,
 		Timeout:      10 * time.Second,
 		CredentialFor: func(host string) (Credential, error) {
 			credentialCalls.Add(1)
@@ -76,14 +75,14 @@ func TestHTTPSRedirectDoesNotForwardCredentialsToAnotherHost(t *testing.T) {
 		t.Fatal("failed to create local redirect test client")
 	}
 	_, probeErr := client.Probe(context.Background(), ProbeRequest{URL: url})
-	if ErrorCode(probeErr) != string(ErrorAuthentication) {
-		t.Fatalf("redirect probe error code = %s, want %s (origin credential=%v, target requests=%d, target credential=%v)", ErrorCode(probeErr), ErrorAuthentication, originReceivedCredential.Load(), targetRequests.Load(), targetReceivedCredential.Load())
+	if ErrorCode(probeErr) != string(ErrorHostDenied) {
+		t.Fatalf("redirect probe error code = %s, want %s (origin credential=%v, target requests=%d, target credential=%v)", ErrorCode(probeErr), ErrorHostDenied, originReceivedCredential.Load(), targetRequests.Load(), targetReceivedCredential.Load())
 	}
 	if originReceivedCredential.Load() == false {
 		t.Fatal("the source repository did not receive its configured credential")
 	}
-	if targetRequests.Load() == 0 {
-		t.Fatal("Git did not follow the cross-host repository redirect")
+	if targetRequests.Load() != 0 {
+		t.Fatalf("Git sent %d requests to the disallowed redirect host", targetRequests.Load())
 	}
 	if targetReceivedCredential.Load() {
 		t.Fatal("the source repository credential was forwarded to the redirect host")
@@ -179,19 +178,8 @@ func newLocalGitCertificate(t *testing.T) (tls.Certificate, []byte) {
 	return certificate, certificatePEM
 }
 
-func configureLocalGitHTTPS(t *testing.T, certificatePEM []byte) {
+func disableHTTPProxyEnvironment(t *testing.T) {
 	t.Helper()
-	certificatePath := filepath.Join(t.TempDir(), "test-ca.pem")
-	if err := os.WriteFile(certificatePath, certificatePEM, 0o600); err != nil {
-		t.Fatal("failed to write temporary local Git CA bundle")
-	}
-	globalConfigPath := filepath.Join(t.TempDir(), "empty-git-config")
-	if err := os.WriteFile(globalConfigPath, nil, 0o600); err != nil {
-		t.Fatal("failed to write empty Git global config")
-	}
-	t.Setenv("GIT_SSL_CAINFO", certificatePath)
-	t.Setenv("GIT_CONFIG_GLOBAL", globalConfigPath)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
 	t.Setenv("no_proxy", "127.0.0.1,localhost")
 	t.Setenv("HTTP_PROXY", "")

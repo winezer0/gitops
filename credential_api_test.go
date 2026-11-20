@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -67,7 +68,7 @@ func TestTestHostCredentialAuthenticatesWithoutLeakingSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Authenticated || result.Diagnostic.Code != "git_credential_authenticated" {
+	if result.CredentialStatus != CredentialStatusAccepted || result.ProfileAccess != ProfileAccessAllowed || result.Diagnostic.Code != "git_credential_authenticated" {
 		t.Fatalf("host credential result = %#v", result)
 	}
 	if got := receivedHeader.Load(); got != "Bearer "+token {
@@ -78,6 +79,29 @@ func TestTestHostCredentialAuthenticatesWithoutLeakingSecrets(t *testing.T) {
 	}
 	if len(events) < 2 || events[len(events)-1].Kind != EventDiagnostic {
 		t.Fatalf("credential operation events = %#v", events)
+	}
+}
+
+func TestCredentialTestSucceededUsesStatusFields(t *testing.T) {
+	tests := []struct {
+		name          string
+		credential    CredentialStatus
+		profileAccess ProfileAccessStatus
+		want          bool
+	}{
+		{name: "profile allowed", credential: CredentialStatusAccepted, profileAccess: ProfileAccessAllowed, want: true},
+		{name: "SSH accepted", credential: CredentialStatusAccepted, profileAccess: ProfileAccessNotChecked, want: true},
+		{name: "profile scope insufficient", credential: CredentialStatusAccepted, profileAccess: ProfileAccessInsufficientScope},
+		{name: "profile denied", credential: CredentialStatusAccepted, profileAccess: ProfileAccessDenied},
+		{name: "credential rejected", credential: CredentialStatusRejected, profileAccess: ProfileAccessNotChecked},
+		{name: "unknown credential", credential: CredentialStatusUnknown, profileAccess: ProfileAccessNotChecked},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := credentialTestSucceeded(test.credential, test.profileAccess); got != test.want {
+				t.Fatalf("credentialTestSucceeded(%q, %q) = %t, want %t", test.credential, test.profileAccess, got, test.want)
+			}
+		})
 	}
 }
 
@@ -112,21 +136,25 @@ func TestTestHostCredentialClassifiesScopeAndRedirectFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !scope.Authenticated || scope.Diagnostic.Code != "git_credential_api_scope_insufficient" {
+	assertCredentialTestFailure(t, err, "git_credential_api_scope_insufficient")
+	if scope.CredentialStatus != CredentialStatusAccepted || scope.ProfileAccess != ProfileAccessInsufficientScope || scope.Diagnostic.Code != "git_credential_api_scope_insufficient" {
 		t.Fatalf("insufficient-scope result = %#v", scope)
 	}
 	client.config.CredentialFor = func(string) (Credential, error) {
 		return Credential{Provider: ProviderCustom, Token: "api-secret", APIURL: server.URL + "/redirect"}, nil
 	}
 	redirect, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if redirect.Authenticated || redirect.Diagnostic.Code != "git_credential_api_redirect" || redirected.Load() != 0 {
+	assertCredentialTestFailure(t, err, "git_credential_api_redirect")
+	if redirect.CredentialStatus != CredentialStatusUnknown || redirect.ProfileAccess != ProfileAccessNotChecked || redirected.Load() != 0 {
 		t.Fatalf("redirect result = %#v, target requests = %d", redirect, redirected.Load())
+	}
+	client.config.CredentialFor = func(string) (Credential, error) {
+		return Credential{Provider: ProviderCustom, Token: "api-secret", APIURL: server.URL + "/denied"}, nil
+	}
+	denied, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host})
+	assertCredentialTestFailure(t, err, "git_credential_api_denied")
+	if denied.CredentialStatus != CredentialStatusUnknown || denied.ProfileAccess != ProfileAccessDenied {
+		t.Fatalf("unauthorized user API result = %#v", denied)
 	}
 }
 
@@ -139,7 +167,8 @@ func TestTestHostCredentialRejectsMissingOrUnapprovedCredentialAPIHost(t *testin
 		t.Fatal(err)
 	}
 	missing, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host})
-	if err != nil || missing.Diagnostic.Code != "git_host_credential_not_configured" {
+	assertCredentialTestFailure(t, err, "git_host_credential_not_configured")
+	if missing.CredentialStatus != CredentialStatusUnknown || missing.ProfileAccess != ProfileAccessNotChecked {
 		t.Fatalf("missing credential result = %#v, %v", missing, err)
 	}
 	target := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -148,7 +177,8 @@ func TestTestHostCredentialRejectsMissingOrUnapprovedCredentialAPIHost(t *testin
 		return Credential{Provider: ProviderCustom, Token: "secret", APIURL: target.URL + "/user"}, nil
 	}
 	unapproved, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host})
-	if err != nil || unapproved.Diagnostic.Code != "git_credential_api_host_not_allowed" {
+	assertCredentialTestFailure(t, err, "git_credential_api_host_not_allowed")
+	if unapproved.CredentialStatus != CredentialStatusUnknown || unapproved.ProfileAccess != ProfileAccessNotChecked {
 		t.Fatalf("unapproved API host result = %#v, %v", unapproved, err)
 	}
 }
@@ -171,9 +201,45 @@ func TestTestHostCredentialTimeoutIsClassified(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := client.TestHostCredential(context.Background(), CredentialTestRequest{Host: host, Timeout: 20 * time.Millisecond})
-	if err == nil || result.Diagnostic.Code != "git_credential_api_timeout" {
+	assertCredentialTestFailure(t, err, "git_credential_api_timeout")
+	if result.CredentialStatus != CredentialStatusUnknown || result.ProfileAccess != ProfileAccessNotChecked || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout result = %#v, %v", result, err)
 	}
+}
+
+func TestSSHCredentialFailureSeparatesRejectionFromHostTrust(t *testing.T) {
+	finish := func(status CredentialStatus, profileAccess ProfileAccessStatus, code, phase, message, recommendation string, retryable bool, cause error) (CredentialTestResult, error) {
+		result := CredentialTestResult{
+			CredentialStatus: status,
+			ProfileAccess:    profileAccess,
+			Diagnostic:       Diagnostic{Code: code, Phase: phase, Message: message, Recommendation: recommendation, Retryable: retryable},
+		}
+		return result, &CredentialTestError{Diagnostic: result.Diagnostic, cause: cause}
+	}
+
+	rejected, err := finishSSHCredentialFailure(context.Background(), errors.New("ssh: unable to authenticate"), finish)
+	assertCredentialTestFailure(t, err, "credential_rejected")
+	if rejected.CredentialStatus != CredentialStatusRejected || rejected.ProfileAccess != ProfileAccessNotChecked {
+		t.Fatalf("rejected SSH credential status = %#v", rejected)
+	}
+
+	untrustedHost, err := finishSSHCredentialFailure(context.Background(), ErrSSHHostKeyNotTrusted, finish)
+	assertCredentialTestFailure(t, err, "git_ssh_host_key_unknown")
+	if untrustedHost.CredentialStatus != CredentialStatusUnknown || untrustedHost.ProfileAccess != ProfileAccessNotChecked {
+		t.Fatalf("untrusted SSH host status = %#v", untrustedHost)
+	}
+}
+
+func assertCredentialTestFailure(t *testing.T, err error, code string) *CredentialTestError {
+	t.Helper()
+	var credentialTestError *CredentialTestError
+	if !errors.As(err, &credentialTestError) {
+		t.Fatalf("credential test error = %T %v, want *CredentialTestError", err, err)
+	}
+	if credentialTestError.Diagnostic.Code != code || ErrorCode(err) != code {
+		t.Fatalf("credential test error code = %q / %q, want %q", credentialTestError.Diagnostic.Code, ErrorCode(err), code)
+	}
+	return credentialTestError
 }
 
 func localCredentialAPIServer(t *testing.T, handler http.Handler) *httptest.Server {

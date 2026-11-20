@@ -58,29 +58,6 @@ func TestValidateHostAllowsConfiguredHostnameOnCustomPort(t *testing.T) {
 	}
 }
 
-func TestSystemGitProbeCloneAndRefs(t *testing.T) {
-	remote := createBareFixture(t)
-	repository := Repository{URL: remote, Host: "local.test", Transport: "https"}
-	probe, err := (systemEngine{binary: "git"}).Probe(context.Background(), repository, ProbeRequest{Ref: "v1"}, Credential{}, 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if probe.ResolvedRef != "v1" || probe.ResolvedCommit == "" || probe.DefaultBranch != "main" {
-		t.Fatalf("unexpected probe result: %#v", probe)
-	}
-	destination := filepath.Join(t.TempDir(), "checkout")
-	if err := os.Mkdir(destination, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cloned, err := (systemEngine{binary: "git"}).Clone(context.Background(), repository, CloneRequest{URL: remote, Ref: "v1", Destination: destination}, Credential{}, 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cloned.Commit != probe.ResolvedCommit || cloned.Engine != "system-git" {
-		t.Fatalf("unexpected clone result: %#v", cloned)
-	}
-}
-
 func TestGoGitProbeCloneAndRefs(t *testing.T) {
 	remote := createBareFixture(t)
 	repository := Repository{URL: remote, Host: "local.test", Transport: "https"}
@@ -111,146 +88,78 @@ func TestGoGitProbeCloneAndRefs(t *testing.T) {
 	}
 }
 
-func TestCredentialEnvironmentScopesHTTPSSecretToRepository(t *testing.T) {
-	repository, err := ParseURL("https://git.example.test/team/repo.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	environment, cleanup, err := credentialEnvironment(repository, Credential{Username: "user", Token: "secret-token"}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	if environment["GIT_CONFIG_KEY_0"] != "credential.helper" || environment["GIT_CONFIG_VALUE_0"] != "" {
-		t.Fatalf("credential helper was not isolated: %#v", environment)
-	}
-	if environment["GIT_CONFIG_KEY_1"] != "http.https://git.example.test/team/repo.git.sslVerify" || environment["GIT_CONFIG_VALUE_1"] != "true" {
-		t.Fatalf("TLS verification was not forced: %#v", environment)
-	}
-	if environment["GIT_CONFIG_KEY_2"] != "http.https://git.example.test/team/repo.git.extraheader" {
-		t.Fatalf("credential scope = %q", environment["GIT_CONFIG_KEY_2"])
-	}
-	if strings.Contains(environment["GIT_CONFIG_VALUE_2"], "secret-token") {
-		t.Fatal("authorization value unexpectedly contains the raw token")
+func TestCredentialHelpersAreRejected(t *testing.T) {
+	_, err := NewClient(Config{UseCredentialHelpers: true})
+	if !errors.Is(err, ErrCredentialHelpersUnsupported) {
+		t.Fatalf("NewClient with credential helpers error = %v, want ErrCredentialHelpersUnsupported", err)
 	}
 }
 
-func TestCredentialHelpersAreOptInAndUsedOnlyWithoutExplicitCredentials(t *testing.T) {
-	repository, err := ParseURL("https://git.example.test/team/repo.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	withHelper, cleanup, err := credentialEnvironment(repository, Credential{}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	if withHelper["GIT_CONFIG_KEY_0"] != "http.https://git.example.test/team/repo.git.sslVerify" || withHelper["GIT_CONFIG_VALUE_0"] != "true" {
-		t.Fatalf("credential helper was not retained for an empty credential: %#v", withHelper)
-	}
-	withoutHelper, cleanup, err := credentialEnvironment(repository, Credential{}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	if withoutHelper["GIT_CONFIG_KEY_0"] != "credential.helper" || withoutHelper["GIT_CONFIG_VALUE_0"] != "" {
-		t.Fatalf("credential helper was not disabled by default: %#v", withoutHelper)
-	}
-	explicitCredential, cleanup, err := credentialEnvironment(repository, Credential{Token: "secret-token"}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	if explicitCredential["GIT_CONFIG_KEY_0"] != "credential.helper" || explicitCredential["GIT_CONFIG_VALUE_0"] != "" {
-		t.Fatalf("configured credential did not take precedence over the helper: %#v", explicitCredential)
+func TestCredentialHelpersUnsupportedClassification(t *testing.T) {
+	if got := ErrorCode(ErrCredentialHelpersUnsupported); got != string(ErrorUnsupported) {
+		t.Fatalf("credential helper error code = %q, want %q", got, ErrorUnsupported)
 	}
 }
 
 func TestCheckoutAndValidateCheckout(t *testing.T) {
 	remote := createBareFixture(t)
 	repository := Repository{URL: remote, Host: "local.test", Transport: "https"}
-	for _, test := range []struct {
-		name   string
-		engine string
-	}{
-		{name: "system Git", engine: "system-git"},
-		{name: "go-git", engine: "go-git"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "checkout")
-			cloned, err := (goGitEngine{}).Clone(context.Background(), repository, CloneRequest{URL: remote, Destination: path}, Credential{}, 0, "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			runGit(t, "-C", path, "branch", "feature")
-			runGit(t, "-C", path, "config", "remote.origin.url", "https://local.test/team/repo.git")
-			client, err := NewClient(Config{GitBinary: "git"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var result CheckoutResult
-			if test.engine == "system-git" {
-				result, err = (systemEngine{binary: "git"}).Checkout(context.Background(), CheckoutRequest{Path: path, Ref: "feature"})
-			} else {
-				result, err = (goGitEngine{}).Checkout(context.Background(), CheckoutRequest{Path: path, Ref: "feature"})
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Commit != cloned.Commit || result.Engine != test.engine {
-				t.Fatalf("checkout result = %#v", result)
-			}
-			valid, commit, err := client.ValidateCheckout(path, "https://local.test/team/repo.git", cloned.Commit)
-			if err != nil || !valid || commit != cloned.Commit {
-				t.Fatalf("ValidateCheckout() = (%v, %q, %v)", valid, commit, err)
-			}
-			if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("modified\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			valid, _, err = client.ValidateCheckout(path, "https://local.test/team/repo.git", cloned.Commit)
-			if valid || !errors.Is(err, ErrDirtyWorktree) {
-				t.Fatalf("dirty checkout validation = (%v, %v)", valid, err)
-			}
-		})
-	}
+	t.Run("go-git", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "checkout")
+		cloned, err := (goGitEngine{}).Clone(context.Background(), repository, CloneRequest{URL: remote, Destination: path}, Credential{}, 0, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, "-C", path, "branch", "feature")
+		runGit(t, "-C", path, "config", "remote.origin.url", "https://local.test/team/repo.git")
+		client, err := NewClient(Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := client.Checkout(context.Background(), CheckoutRequest{Path: path, Ref: "feature"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Commit != cloned.Commit || result.Engine != "go-git" {
+			t.Fatalf("checkout result = %#v", result)
+		}
+		valid, commit, err := client.ValidateCheckout(path, "https://local.test/team/repo.git", cloned.Commit)
+		if err != nil || !valid || commit != cloned.Commit {
+			t.Fatalf("ValidateCheckout() = (%v, %q, %v)", valid, commit, err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("modified\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		valid, _, err = client.ValidateCheckout(path, "https://local.test/team/repo.git", cloned.Commit)
+		if valid || !errors.Is(err, ErrDirtyWorktree) {
+			t.Fatalf("dirty checkout validation = (%v, %v)", valid, err)
+		}
+	})
 }
 
 func TestCloneResolvesOlderCommitSHA(t *testing.T) {
 	remote, oldCommit := createHistoryFixture(t)
 	repository := Repository{URL: remote, Host: "local.test", Transport: "https"}
-	for _, test := range []struct {
-		name   string
-		engine engine
-	}{
-		{name: "system Git", engine: systemEngine{binary: "git"}},
-		{name: "go-git", engine: goGitEngine{}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			destination := filepath.Join(t.TempDir(), "clone")
-			if err := os.Mkdir(destination, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			result, err := test.engine.Clone(context.Background(), repository, CloneRequest{URL: remote, Commit: oldCommit, Destination: destination}, Credential{}, 0, "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Commit != oldCommit {
-				t.Fatalf("cloned commit = %s, want %s", result.Commit, oldCommit)
-			}
-		})
+	destination := filepath.Join(t.TempDir(), "clone")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (goGitEngine{}).Clone(context.Background(), repository, CloneRequest{URL: remote, Commit: oldCommit, Destination: destination}, Credential{}, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Commit != oldCommit {
+		t.Fatalf("cloned commit = %s, want %s", result.Commit, oldCommit)
 	}
 }
 
-func TestClientRestrictsHostsAndFallsBackWhenGitMissing(t *testing.T) {
-	client, err := NewClient(Config{GitBinary: "missing-git-binary", AllowedHosts: []string{"git.example.test"}})
+func TestClientRestrictsHostsBeforeConnecting(t *testing.T) {
+	client, err := NewClient(Config{AllowedHosts: []string{"git.example.test"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Probe(context.Background(), ProbeRequest{URL: "https://other.example.test/repo.git"}); !errors.Is(err, ErrHostNotAllowed) {
 		t.Fatalf("host policy error = %v", err)
-	}
-	if _, err := client.Probe(context.Background(), ProbeRequest{URL: "https://git.example.test/repo.git"}); err == nil {
-		t.Fatalf("missing Git should attempt fallback and return connection error, got %v", err)
 	}
 }
 
@@ -285,10 +194,6 @@ func TestErrorClassificationAndSecretRedaction(t *testing.T) {
 			t.Errorf("classifyError(%v) = %q, want %q", test.err, kind, test.kind)
 		}
 	}
-	classified = commandError([]byte("fatal: Authentication failed for token secret-value"), fmt.Errorf("exit status 128"))
-	if ErrorCode(classified) != string(ErrorAuthentication) || strings.Contains(classified.Error(), "secret-value") {
-		t.Fatalf("command diagnostic was not safely classified: %v", classified)
-	}
 	for _, message := range []string{
 		"remote: HTTP Basic: Access denied",
 		"remote: Unauthorized",
@@ -296,19 +201,19 @@ func TestErrorClassificationAndSecretRedaction(t *testing.T) {
 		"remote: Forbidden",
 		"fatal: could not read Username for 'https://git.example.test': terminal prompts disabled",
 	} {
-		if ErrorCode(commandError([]byte(message), fmt.Errorf("exit status 128"))) != string(ErrorAuthentication) {
-			t.Errorf("command diagnostic %q was not classified as authentication failure", message)
+		if ErrorCode(fmt.Errorf("%s", message)) != string(ErrorAuthentication) {
+			t.Errorf("authentication message %q was not classified as authentication failure", message)
 		}
 	}
 }
 
 func TestProgressWriterEmitsStructuredProgress(t *testing.T) {
 	var events []ProgressEvent
-	writer := progressWriter{engine: "system-git", callback: func(event ProgressEvent) { events = append(events, event) }}
+	writer := progressWriter{engine: "go-git", callback: func(event ProgressEvent) { events = append(events, event) }}
 	if _, err := writer.Write([]byte("Receiving objects: 47% (14/30), 2.1 MiB | 1.2 MiB/s\r")); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0] != (ProgressEvent{Engine: "system-git", Phase: "receiving objects", Percent: 47, ReceivedObjects: 14, TotalObjects: 30, BytesReceived: 2202009}) {
+	if len(events) != 1 || events[0] != (ProgressEvent{Engine: "go-git", Phase: "receiving objects", Percent: 47, ReceivedObjects: 14, TotalObjects: 30, BytesReceived: 2202009}) {
 		t.Fatalf("progress events = %#v", events)
 	}
 }
@@ -316,7 +221,7 @@ func TestProgressWriterEmitsStructuredProgress(t *testing.T) {
 func TestCommitProbeReportsDeferredValidation(t *testing.T) {
 	commit := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	output := []byte("ref: refs/heads/main\tHEAD\n" + strings.Repeat("b", 40) + "\trefs/heads/main\n")
-	result, err := parseReferences(Repository{}, commit, output, "system-git")
+	result, err := parseReferences(Repository{}, commit, output, "go-git")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +232,7 @@ func TestCommitProbeReportsDeferredValidation(t *testing.T) {
 
 func TestClientAppliesHostValidationBeforeGit(t *testing.T) {
 	called := false
-	client, err := NewClient(Config{GitBinary: "missing-git-binary", ValidateHost: func(_ context.Context, host string) error {
+	client, err := NewClient(Config{ValidateHost: func(_ context.Context, host string) error {
 		called = true
 		if host != "git.example.test" {
 			t.Fatalf("validated host = %q", host)

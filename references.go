@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 var commitPattern = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
@@ -96,3 +98,13 @@ func limitReferences(result *ProbeResult, maximum int) {
 }
 
 func isCommit(value string) bool { return commitPattern.MatchString(value) }
+
+func validateRequestedRef(value string) error {
+	if value == "" || isCommit(value) {
+		return nil
+	}
+	if strings.HasPrefix(value, "-") || plumbing.NewBranchReferenceName(value).Validate() != nil || plumbing.NewTagReferenceName(value).Validate() != nil {
+		return ErrInvalidReference
+	}
+	return nil
+}

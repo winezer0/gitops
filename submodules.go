@@ -43,7 +43,7 @@ func (client *Client) cloneSubmodules(ctx context.Context, request CloneRequest,
 		depth:           request.Depth,
 		onProgress:      request.OnProgress,
 		onEvent:         request.OnEvent,
-		cloneRepository: client.cloneWithFallback,
+		cloneRepository: client.clone,
 	}
 	return state.clone(repository, credential, destination, 0)
 }

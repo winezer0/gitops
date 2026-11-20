@@ -2,7 +2,9 @@ package gitops
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 )
@@ -70,4 +72,31 @@ func monitorWorkspaceSize(ctx context.Context, root string, maximum int64, cance
 			}
 		}
 	}
+}
+
+func publishWorkspace(staging, destination string, replaceExisting bool) error {
+	if !replaceExisting {
+		return os.Rename(staging, destination)
+	}
+	parent := filepath.Dir(destination)
+	backup, err := os.MkdirTemp(parent, "."+filepath.Base(destination)+".gitops-backup-")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	if err := os.Rename(destination, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(staging, destination); err != nil {
+		if restoreErr := os.Rename(backup, destination); restoreErr != nil {
+			return fmt.Errorf("publish staged workspace: %w; original workspace remains at %q: %v", err, backup, restoreErr)
+		}
+		return fmt.Errorf("publish staged workspace: %w", err)
+	}
+	if err := os.RemoveAll(backup); err != nil {
+		return fmt.Errorf("new workspace was published but backup %q could not be removed: %w", backup, err)
+	}
+	return nil
 }

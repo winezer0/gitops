@@ -8,34 +8,6 @@ import (
 	"testing"
 )
 
-func TestSystemGitSparseCloneMaterializesSelectedDirectories(t *testing.T) {
-	remote := createSparseFixture(t)
-	destination := filepath.Join(t.TempDir(), "checkout")
-	if err := os.Mkdir(destination, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	var events []OperationEvent
-	result, err := (systemEngine{binary: "git"}).Clone(context.Background(), Repository{URL: remote, Host: "local.test", Transport: "https"}, CloneRequest{
-		URL: remote, Destination: destination, Depth: 1, SparsePaths: []string{"advisories/github-reviewed"},
-		OnEvent: func(event OperationEvent) { events = append(events, event) },
-	}, Credential{}, 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Commit == "" {
-		t.Fatal("sparse clone returned an empty commit")
-	}
-	if _, err := os.Stat(filepath.Join(destination, "advisories", "github-reviewed", "GHSA-test.json")); err != nil {
-		t.Fatalf("selected sparse file is missing: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(destination, "docs", "unselected.txt")); !os.IsNotExist(err) {
-		t.Fatalf("unselected file exists or could not be checked: %v", err)
-	}
-	if !hasProcessEvent(events, "clone") {
-		t.Fatalf("clone process outcome was not reported: %#v", events)
-	}
-}
-
 func TestSparsePathValidationRejectsUnsafeAndPortableCollisions(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -59,17 +31,26 @@ func TestSparsePathValidationRejectsUnsafeAndPortableCollisions(t *testing.T) {
 	}
 }
 
-func TestGoGitSparseCloneReturnsUnsupported(t *testing.T) {
-	remote := createBareFixture(t)
+func TestGoGitSparseCloneMaterializesSelectedDirectories(t *testing.T) {
+	remote := createSparseFixture(t)
 	destination := filepath.Join(t.TempDir(), "checkout")
 	if err := os.Mkdir(destination, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err := (goGitEngine{}).Clone(context.Background(), Repository{URL: remote, Host: "local.test", Transport: "https"}, CloneRequest{
-		URL: remote, Destination: destination, SparsePaths: []string{"docs"},
+	result, err := (goGitEngine{}).Clone(context.Background(), Repository{URL: remote, Host: "local.test", Transport: "https"}, CloneRequest{
+		URL: remote, Destination: destination, Depth: 1, SparsePaths: []string{"advisories/github-reviewed"},
 	}, Credential{}, 0, "")
-	if err != ErrUnsupported {
-		t.Fatalf("go-git sparse clone error = %v, want unsupported", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Commit == "" {
+		t.Fatal("go-git sparse clone returned an empty commit")
+	}
+	if _, err := os.Stat(filepath.Join(destination, "advisories", "github-reviewed", "GHSA-test.json")); err != nil {
+		t.Fatalf("selected sparse file is missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "docs", "unselected.txt")); !os.IsNotExist(err) {
+		t.Fatalf("unselected file exists or could not be checked: %v", err)
 	}
 }
 
@@ -101,13 +82,4 @@ func createSparseFixture(t *testing.T) string {
 		t.Fatal("bare fixture was not initialized")
 	}
 	return bare
-}
-
-func hasProcessEvent(events []OperationEvent, operation string) bool {
-	for _, event := range events {
-		if event.Kind == EventProcess && event.Operation == operation && event.Process != nil && event.Process.Name != "" {
-			return true
-		}
-	}
-	return false
 }

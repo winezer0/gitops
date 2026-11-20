@@ -26,6 +26,10 @@ func ErrorCode(err error) string {
 	if err == nil {
 		return ""
 	}
+	var credentialTestError *CredentialTestError
+	if errors.As(err, &credentialTestError) && credentialTestError.Diagnostic.Code != "" {
+		return credentialTestError.Diagnostic.Code
+	}
 	var operationError *OperationError
 	if errors.As(err, &operationError) {
 		return string(operationError.Kind)
@@ -48,12 +52,24 @@ func classifyError(err error) (ErrorKind, bool) {
 		return ErrorNetwork, true
 	case errors.Is(err, ErrInvalidReference):
 		return ErrorInvalidRef, false
+	case errors.Is(err, ErrCommitUnavailableAtDepth):
+		return ErrorRefUnavailableAtDepth, false
 	case errors.Is(err, ErrNoReferences):
 		return ErrorNotFound, false
 	case errors.Is(err, ErrHostNotAllowed):
 		return ErrorHostDenied, false
 	case errors.Is(err, ErrCredentialNotConfigured):
 		return ErrorCredentialMissing, false
+	case errors.Is(err, ErrCredentialHelpersUnsupported):
+		return ErrorUnsupported, false
+	case errors.Is(err, ErrSSHHostKeyTrustNotConfigured):
+		return ErrorCredentialMissing, false
+	case errors.Is(err, ErrSSHKeyPassphraseMissing):
+		return ErrorCredentialMissing, false
+	case errors.Is(err, ErrSSHIdentityLimit):
+		return ErrorResourceLimit, false
+	case errors.Is(err, ErrSSHHostKeyNotTrusted), errors.Is(err, ErrSSHHostKeyChanged):
+		return ErrorAuthentication, false
 	case errors.Is(err, ErrUnsupported):
 		return ErrorUnsupported, false
 	case errors.Is(err, ErrCloneSizeLimit):
@@ -84,31 +100,9 @@ func classifyError(err error) (ErrorKind, bool) {
 	}
 }
 
-func commandError(resultOutput []byte, err error) error {
-	if err == nil {
-		return nil
-	}
-	message := strings.ToLower(string(resultOutput))
-	kind, retryable := classifyError(err)
-	switch {
-	case isAuthenticationMessage(message), strings.Contains(message, "returned error: 401"), strings.Contains(message, "returned error: 403"):
-		kind, retryable = ErrorAuthentication, false
-	case strings.Contains(message, "repository not found"), strings.Contains(message, "does not appear to be a git repository"), strings.Contains(message, "returned error: 404"):
-		kind, retryable = ErrorNotFound, false
-	case strings.Contains(message, "could not resolve host"), strings.Contains(message, "failed to connect"), strings.Contains(message, "connection timed out"):
-		kind, retryable = ErrorNetwork, true
-	case strings.Contains(message, "certificate"), strings.Contains(message, "ssl certificate problem"), strings.Contains(message, "tls"):
-		kind, retryable = ErrorNetwork, false
-	case strings.Contains(message, "host key verification failed"):
-		kind, retryable = ErrorAuthentication, false
-	}
-	diagnostic := diagnosticFromCommandOutput(resultOutput, err)
-	return &OperationError{Kind: kind, Retryable: retryable, Cause: err, Diagnostic: &diagnostic}
-}
-
 func isAuthenticationMessage(message string) bool {
 	for _, marker := range []string{
-		"authentication failed", "authentication required", "auth required", "authorization failed",
+		"authentication failed", "authentication required", "unable to authenticate", "auth required", "authorization failed",
 		"permission denied", "access denied", "unauthorized", "forbidden", "invalid credentials",
 		"incorrect username or password", "invalid username or password", "http basic",
 		"could not read username", "could not read password", "terminal prompts disabled",

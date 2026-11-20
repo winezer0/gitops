@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,13 +19,6 @@ import (
 )
 
 func TestUnknownSSHHostKeyIsRejectedBeforeAuthentication(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("system Git is required to exercise the SSH transport")
-	}
-	if _, err := exec.LookPath("ssh"); err != nil {
-		t.Skip("OpenSSH client is required to exercise host-key validation")
-	}
-
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal("failed to start the local SSH test server")
@@ -38,6 +31,14 @@ func TestUnknownSSHHostKeyIsRejectedBeforeAuthentication(t *testing.T) {
 	signer, err := ssh.NewSignerFromKey(privateKey)
 	if err != nil {
 		t.Fatal("failed to prepare the local SSH host key")
+	}
+	_, userPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal("failed to generate the local SSH user key")
+	}
+	userKey, err := ssh.MarshalPrivateKey(userPrivate, "test")
+	if err != nil {
+		t.Fatal("failed to encode the local SSH user key")
 	}
 	var authenticationAttempts atomic.Int32
 	serverConfig := &ssh.ServerConfig{PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
@@ -84,8 +85,12 @@ func TestUnknownSSHHostKeyIsRejectedBeforeAuthentication(t *testing.T) {
 	}
 
 	client, err := NewClient(Config{
-		AllowedHosts: []string{listener.Addr().String()},
-		Timeout:      10 * time.Second,
+		AllowedHosts:       []string{listener.Addr().String()},
+		SSHKnownHostsFiles: []string{filepath.Join(sshDirectory, "known_hosts")},
+		CredentialFor: func(string) (Credential, error) {
+			return Credential{SSHPrivateKey: pem.EncodeToMemory(userKey)}, nil
+		},
+		Timeout: 10 * time.Second,
 	})
 	if err != nil {
 		t.Fatal("failed to create SSH test client")

@@ -9,14 +9,13 @@ import (
 	"testing"
 )
 
-func TestReferenceAndCloneMatrixForBothEngines(t *testing.T) {
+func TestReferenceAndCloneMatrixForGoGit(t *testing.T) {
 	remote := createBareFixture(t)
 	mainCommit := strings.TrimSpace(string(runGitOutput(t, "--git-dir", remote, "rev-parse", "refs/heads/main")))
 	engines := []struct {
 		name   string
 		engine engine
 	}{
-		{name: "system Git", engine: systemEngine{binary: "git"}},
 		{name: "go-git", engine: goGitEngine{}},
 	}
 	for _, test := range engines {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,14 +19,14 @@ func TestClientCloneCleansDestinationAfterRemoteFailure(t *testing.T) {
 		writer.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer server.Close()
-	configureLocalGitHTTPS(t, certificatePEM)
+	disableHTTPProxyEnvironment(t)
 
 	repositoryURL := server.URL + "/team/missing.git"
 	repository, err := ParseURL(repositoryURL)
 	if err != nil {
 		t.Fatal("failed to parse test repository URL")
 	}
-	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 5 * time.Second})
+	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 5 * time.Second, CABundle: certificatePEM})
 	if err != nil {
 		t.Fatal("failed to create test Git client")
 	}
@@ -37,15 +38,53 @@ func TestClientCloneCleansDestinationAfterRemoteFailure(t *testing.T) {
 	assertPathDoesNotExist(t, destination)
 }
 
+func TestClientClonePreservesExistingDestinationAfterFailure(t *testing.T) {
+	certificate, certificatePEM := newLocalGitCertificate(t)
+	server := newLocalGitTLSServer(t, certificate, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("WWW-Authenticate", `Basic realm="clone-rollback"`)
+		writer.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	disableHTTPProxyEnvironment(t)
+
+	repositoryURL := server.URL + "/team/private.git"
+	repository, err := ParseURL(repositoryURL)
+	if err != nil {
+		t.Fatal("failed to parse test repository URL")
+	}
+	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 5 * time.Second, CABundle: certificatePEM})
+	if err != nil {
+		t.Fatal("failed to create test Git client")
+	}
+	destination := filepath.Join(t.TempDir(), "clone")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal("failed to prepare existing workspace")
+	}
+	marker := filepath.Join(destination, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal("failed to prepare existing workspace marker")
+	}
+	_, err = client.Clone(context.Background(), CloneRequest{
+		URL: repositoryURL, Ref: "main", Destination: destination, ReplaceExisting: true,
+	})
+	if ErrorCode(err) != string(ErrorAuthentication) {
+		t.Fatalf("failed replacement error code = %s, want %s", ErrorCode(err), ErrorAuthentication)
+	}
+	contents, readErr := os.ReadFile(marker)
+	if readErr != nil || string(contents) != "keep" {
+		t.Fatalf("existing workspace marker was not preserved: %v", readErr)
+	}
+}
+
 func TestClientCloneCleansDestinationOnCancellation(t *testing.T) {
-	server, requestStarted := newBlockingLocalGitServer(t)
+	server, requestStarted, certificatePEM := newBlockingLocalGitServer(t)
 	defer server.Close()
 	repositoryURL := server.URL + "/team/private.git"
 	repository, err := ParseURL(repositoryURL)
 	if err != nil {
 		t.Fatal("failed to parse test repository URL")
 	}
-	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 10 * time.Second})
+	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 10 * time.Second, CABundle: certificatePEM})
 	if err != nil {
 		t.Fatal("failed to create test Git client")
 	}
@@ -71,7 +110,7 @@ func TestClientCloneCleansDestinationOnCancellation(t *testing.T) {
 }
 
 func TestClientCloneCleansDestinationAtSizeLimit(t *testing.T) {
-	server, requestStarted := newBlockingLocalGitServer(t)
+	server, requestStarted, certificatePEM := newBlockingLocalGitServer(t)
 	defer server.Close()
 	repositoryURL := server.URL + "/team/private.git"
 	repository, err := ParseURL(repositoryURL)
@@ -79,7 +118,7 @@ func TestClientCloneCleansDestinationAtSizeLimit(t *testing.T) {
 		t.Fatal("failed to parse test repository URL")
 	}
 	const maximumCloneBytes = 64 << 10
-	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 10 * time.Second, MaxCloneBytes: maximumCloneBytes})
+	client, err := NewClient(Config{AllowedHosts: []string{repository.Host}, Timeout: 10 * time.Second, MaxCloneBytes: maximumCloneBytes, CABundle: certificatePEM})
 	if err != nil {
 		t.Fatal("failed to create test Git client")
 	}
@@ -91,7 +130,22 @@ func TestClientCloneCleansDestinationAtSizeLimit(t *testing.T) {
 	}()
 	waitForLocalGitRequest(t, requestStarted)
 	oversizedObject := make([]byte, maximumCloneBytes+1)
-	if err := os.WriteFile(filepath.Join(destination, "materialized-object"), oversizedObject, 0o600); err != nil {
+	stagingPattern := "." + filepath.Base(destination) + ".gitops-stage-"
+	entries, err := os.ReadDir(filepath.Dir(destination))
+	if err != nil {
+		t.Fatal("failed to inspect staging directory")
+	}
+	var staging string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), stagingPattern) {
+			staging = filepath.Join(filepath.Dir(destination), entry.Name())
+			break
+		}
+	}
+	if staging == "" {
+		t.Fatal("clone staging directory was not created")
+	}
+	if err := os.WriteFile(filepath.Join(staging, "materialized-object"), oversizedObject, 0o600); err != nil {
 		t.Fatal("failed to materialize test clone data")
 	}
 	select {
@@ -120,7 +174,7 @@ func TestClientCloneCleansDestinationForInvalidRef(t *testing.T) {
 	assertPathDoesNotExist(t, destination)
 }
 
-func newBlockingLocalGitServer(t *testing.T) (*httptest.Server, <-chan struct{}) {
+func newBlockingLocalGitServer(t *testing.T) (*httptest.Server, <-chan struct{}, []byte) {
 	t.Helper()
 	certificate, certificatePEM := newLocalGitCertificate(t)
 	requestStarted := make(chan struct{}, 1)
@@ -131,8 +185,8 @@ func newBlockingLocalGitServer(t *testing.T) (*httptest.Server, <-chan struct{})
 		}
 		<-request.Context().Done()
 	}))
-	configureLocalGitHTTPS(t, certificatePEM)
-	return server, requestStarted
+	disableHTTPProxyEnvironment(t)
+	return server, requestStarted, certificatePEM
 }
 
 func waitForLocalGitRequest(t *testing.T, requestStarted <-chan struct{}) {
@@ -140,7 +194,7 @@ func waitForLocalGitRequest(t *testing.T, requestStarted <-chan struct{}) {
 	select {
 	case <-requestStarted:
 	case <-time.After(5 * time.Second):
-		t.Fatal("system Git did not reach the local test server")
+		t.Fatal("Git client did not reach the local test server")
 	}
 }
 

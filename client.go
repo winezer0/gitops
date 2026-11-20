@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +15,9 @@ import (
 
 // NewClient validates configuration and creates a Git operation client.
 func NewClient(config Config) (*Client, error) {
+	if config.UseCredentialHelpers {
+		return nil, ErrCredentialHelpersUnsupported
+	}
 	if config.Timeout < 0 {
 		return nil, fmt.Errorf("timeout must not be negative")
 	}
@@ -24,9 +29,6 @@ func NewClient(config Config) (*Client, error) {
 	}
 	if config.MaxCloneBytes == 0 {
 		config.MaxCloneBytes = 5 << 30
-	}
-	if config.GitBinary == "" {
-		config.GitBinary = "git"
 	}
 	return &Client{config: config}, nil
 }
@@ -44,7 +46,7 @@ func (client *Client) Probe(ctx context.Context, request ProbeRequest) (ProbeRes
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	repository, credential, err := client.prepare(ctx, request.URL)
+	repository, credential, err := client.prepare(ctx, request.URL, request.Credential)
 	if err != nil {
 		repositoryHint, _ := ParseURL(request.URL)
 		return client.probeFailure(ProbeResult{}, err, "host_validation", repositoryHint, request.Ref, timeout, started, request.OnEvent)
@@ -53,11 +55,7 @@ func (client *Client) Probe(ctx context.Context, request ProbeRequest) (ProbeRes
 	if err != nil {
 		return client.probeFailure(ProbeResult{}, err, "network_setup", repository, request.Ref, timeout, started, request.OnEvent)
 	}
-	primary, fallback := client.engines()
-	result, err := primary.Probe(ctx, repository, request, credential, timeout, proxyURL)
-	if err != nil && errors.Is(err, ErrGitUnavailable) && fallbackAllowed(repository, credential) {
-		result, err = fallback.Probe(ctx, repository, request, credential, timeout, proxyURL)
-	}
+	result, err := (goGitEngine{config: client.config}).Probe(ctx, repository, request, credential, timeout, proxyURL)
 	if err != nil {
 		return client.probeFailure(result, err, "reference_lookup", repository, request.Ref, timeout, started, request.OnEvent)
 	}
@@ -92,7 +90,7 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 	defer cancel()
 	var credential Credential
 	var err error
-	repository, credential, err = client.prepare(ctx, request.URL)
+	repository, credential, err = client.prepare(ctx, request.URL, request.Credential)
 	if err != nil {
 		return CloneResult{}, operationError(err)
 	}
@@ -131,14 +129,13 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 			emitProgress(request.OnEvent, OperationEvent{Kind: EventDiagnostic, Operation: "clone", Engine: result.Engine, Diagnostic: &diagnostic})
 			return result, nil
 		}
-		if err := os.RemoveAll(destination); err != nil {
-			return CloneResult{}, operationError(err)
-		}
 	}
-	if err := os.Mkdir(destination, 0o700); err != nil {
+	staging, err := os.MkdirTemp(filepath.Dir(destination), "."+filepath.Base(destination)+".gitops-stage-")
+	if err != nil {
 		return CloneResult{}, operationError(err)
 	}
-	request.Destination = destination
+	defer os.RemoveAll(staging)
+	request.Destination = staging
 	maxBytes := client.config.MaxCloneBytes
 	if request.MaxBytes > 0 {
 		maxBytes = request.MaxBytes
@@ -147,36 +144,35 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 	monitorContext, cancelMonitor := context.WithCancel(ctx)
 	monitorResult := make(chan error, 1)
 	go func() {
-		monitorResult <- monitorWorkspaceSize(monitorContext, destination, maxBytes, cancelClone)
+		monitorResult <- monitorWorkspaceSize(monitorContext, staging, maxBytes, cancelClone)
 	}()
-	result, err := client.cloneWithFallback(cloneContext, repository, request, credential)
+	result, err := client.clone(cloneContext, repository, request, credential)
 	if err == nil && request.RecurseSubmodules {
-		err = client.cloneSubmodules(cloneContext, request, repository, credential, destination)
+		err = client.cloneSubmodules(cloneContext, request, repository, credential, staging)
 	}
 	cancelMonitor()
 	monitorErr := <-monitorResult
 	cancelClone()
 	if errors.Is(monitorErr, ErrCloneSizeLimit) {
-		_ = os.RemoveAll(destination)
 		return CloneResult{}, operationError(ErrCloneSizeLimit)
 	}
 	if monitorErr != nil && !errors.Is(monitorErr, context.Canceled) {
-		_ = os.RemoveAll(destination)
 		return CloneResult{}, operationError(monitorErr)
 	}
 	if err != nil {
-		_ = os.RemoveAll(destination)
 		return CloneResult{}, operationError(err)
 	}
-	if err := checkWorkspaceSize(ctx, destination, maxBytes); err != nil {
-		_ = os.RemoveAll(destination)
+	if err := checkWorkspaceSize(ctx, staging, maxBytes); err != nil {
 		return CloneResult{}, operationError(err)
 	}
-	result.SizeBytes, err = directorySize(destination)
+	result.SizeBytes, err = directorySize(staging)
 	if err != nil {
-		_ = os.RemoveAll(destination)
 		return CloneResult{}, operationError(err)
 	}
+	if err := publishWorkspace(staging, destination, exists); err != nil {
+		return CloneResult{}, operationError(err)
+	}
+	result.Path = destination
 	diagnostic := Diagnostic{Code: "git_clone_succeeded", Phase: "checkout", Message: "Git repository was cloned successfully.", Host: repository.Host, Ref: result.ResolvedRef, Transport: repository.Transport, Duration: time.Since(started), Timeout: timeout}
 	emitProgress(request.OnEvent, OperationEvent{Kind: EventDiagnostic, Operation: "clone", Engine: result.Engine, Diagnostic: &diagnostic})
 	return result, operationError(err)
@@ -184,21 +180,12 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 
 // TestCredential verifies that a credential can read the supplied repository.
 func (client *Client) TestCredential(ctx context.Context, request ProbeRequest, credential Credential) (ProbeResult, error) {
-	repository, err := ParseURL(request.URL)
-	if err != nil {
-		return ProbeResult{}, operationError(err)
-	}
-	temporary := *client
-	temporary.config.CredentialFor = func(host string) (Credential, error) {
-		if normalizeHost(host) != repository.Host {
-			return Credential{}, ErrHostNotAllowed
-		}
-		return credential, nil
-	}
-	return temporary.Probe(ctx, request)
+	request.Credential = &credential
+	return client.Probe(ctx, request)
 }
 
 // TestHostCredential verifies a host credential through its provider API or strict SSH handshake.
+// Failed checks return the diagnostic result together with a *CredentialTestError.
 func (client *Client) TestHostCredential(ctx context.Context, request CredentialTestRequest) (CredentialTestResult, error) {
 	return client.testHostCredential(ctx, request)
 }
@@ -220,10 +207,7 @@ func (client *Client) Checkout(ctx context.Context, request CheckoutRequest) (Ch
 	}
 	ctx, cancel := context.WithTimeout(ctx, client.requestTimeout(request.Timeout))
 	defer cancel()
-	result, err := (systemEngine{binary: client.config.GitBinary}).Checkout(ctx, request)
-	if errors.Is(err, ErrGitUnavailable) {
-		return (goGitEngine{}).Checkout(ctx, request)
-	}
+	result, err := (goGitEngine{config: client.config}).Checkout(ctx, request)
 	return result, operationError(err)
 }
 
@@ -277,7 +261,7 @@ func (client *Client) ValidateCheckout(path, expectedURL, expectedCommit string)
 	return true, commit, nil
 }
 
-func (client *Client) prepare(ctx context.Context, raw string) (Repository, Credential, error) {
+func (client *Client) prepare(ctx context.Context, raw string, explicit ...*Credential) (Repository, Credential, error) {
 	repository, err := ParseURL(raw)
 	if err != nil {
 		return Repository{}, Credential{}, err
@@ -290,17 +274,82 @@ func (client *Client) prepare(ctx context.Context, raw string) (Repository, Cred
 			return Repository{}, Credential{}, err
 		}
 	}
-	var credential Credential
-	if client.config.CredentialFor != nil {
-		credential, err = client.config.CredentialFor(repository.Host)
+	if repository.Transport == "ssh" && client.config.DiscoverSSHKeys {
+		discovered, err := discoverSSHConfig(repository, client.config)
+		if err != nil {
+			return Repository{}, Credential{}, err
+		}
+		targetHostname := discovered.HostName
+		targetPort := discovered.Port
+		if strings.Contains(repository.URL, "://") {
+			parsed, parseErr := url.Parse(repository.URL)
+			if parseErr != nil {
+				return Repository{}, Credential{}, ErrInvalidURL
+			}
+			if parsed.Port() != "" {
+				targetPort = parsed.Port()
+			}
+			if targetHostname == "" {
+				targetHostname = parsed.Hostname()
+			}
+		} else if targetHostname == "" {
+			targetHostname, _, err = sshAliasAndPort(repository.URL)
+			if err != nil {
+				return Repository{}, Credential{}, err
+			}
+		}
+		targetHost := targetHostname
+		if targetPort != "" {
+			targetHost = net.JoinHostPort(targetHostname, targetPort)
+		}
+		if normalizeHost(targetHost) != normalizeHost(repository.Host) {
+			if err := client.allowHost(targetHost); err != nil {
+				return Repository{}, Credential{}, err
+			}
+			if client.config.ValidateHost != nil {
+				if err := client.config.ValidateHost(ctx, targetHost); err != nil {
+					return Repository{}, Credential{}, err
+				}
+			}
+		}
 	}
-	if err == nil && repository.Transport == "https" && len(credential.SSHPrivateKey) > 0 {
+	var credential Credential
+	explicitProvided := len(explicit) > 0 && explicit[0] != nil
+	fallbackToLegacy := !explicitProvided && client.config.CredentialForRepository == nil
+	if explicitProvided {
+		credential = *explicit[0]
+		if !credentialHasSecret(credential) {
+			return Repository{}, Credential{}, ErrCredentialNotConfigured
+		}
+	} else if client.config.CredentialForRepository != nil {
+		credential, err = client.config.CredentialForRepository(repository)
+		if errors.Is(err, ErrCredentialNotConfigured) {
+			fallbackToLegacy = true
+			credential = Credential{}
+			err = nil
+		}
+	}
+	if fallbackToLegacy && err == nil && client.config.CredentialFor != nil {
+		credential, err = client.config.CredentialFor(repository.Host)
+		if errors.Is(err, ErrCredentialNotConfigured) {
+			credential = Credential{}
+			err = nil
+		}
+	}
+	if !explicitProvided && err == nil && !credentialHasSecret(credential) && repository.Transport == "ssh" && !client.config.DiscoverSSHKeys {
+		return Repository{}, Credential{}, ErrCredentialNotConfigured
+	}
+	if err == nil && repository.Transport == "https" && (len(credential.SSHPrivateKey) > 0 || credential.SSHPrivateKeyPath != "") {
 		err = fmt.Errorf("SSH credentials cannot be used with HTTPS repositories")
 	}
 	if err == nil && repository.Transport == "ssh" && (credential.Token != "" || credential.Password != "") {
 		err = fmt.Errorf("HTTPS credentials cannot be used with SSH repositories")
 	}
 	return repository, credential, err
+}
+
+func credentialHasSecret(credential Credential) bool {
+	return credential.Token != "" || credential.Password != "" || len(credential.SSHPrivateKey) > 0 || credential.SSHPrivateKeyPath != ""
 }
 
 func (client *Client) allowHost(host string) error {
@@ -379,21 +428,12 @@ func withinRoot(root, path string) error {
 	return nil
 }
 
-func (client *Client) engines() (engine, engine) {
-	return systemEngine{binary: client.config.GitBinary, useCredentialHelpers: client.config.UseCredentialHelpers}, goGitEngine{}
-}
-
-func (client *Client) cloneWithFallback(ctx context.Context, repository Repository, request CloneRequest, credential Credential) (CloneResult, error) {
+func (client *Client) clone(ctx context.Context, repository Repository, request CloneRequest, credential Credential) (CloneResult, error) {
 	proxyURL, err := client.proxy(ctx, repository.Transport)
 	if err != nil {
 		return CloneResult{}, err
 	}
-	primary, fallback := client.engines()
-	result, err := primary.Clone(ctx, repository, request, credential, client.requestTimeout(request.Timeout), proxyURL)
-	if err != nil && errors.Is(err, ErrGitUnavailable) && fallbackAllowed(repository, credential) {
-		result, err = fallback.Clone(ctx, repository, request, credential, client.requestTimeout(request.Timeout), proxyURL)
-	}
-	return result, err
+	return (goGitEngine{config: client.config}).Clone(ctx, repository, request, credential, client.requestTimeout(request.Timeout), proxyURL)
 }
 
 func (client *Client) requestTimeout(requested time.Duration) time.Duration {
@@ -424,10 +464,6 @@ func (client *Client) probeFailure(result ProbeResult, err error, phase string, 
 	result.Diagnostic = &diagnostic
 	emitProgress(observer, OperationEvent{Kind: EventDiagnostic, Operation: "probe", Engine: result.Engine, Diagnostic: &diagnostic})
 	return result, &OperationError{Kind: errorKind(err), Retryable: diagnostic.Retryable, Cause: err, Diagnostic: &diagnostic}
-}
-
-func fallbackAllowed(repository Repository, credential Credential) bool {
-	return repository.Transport == "https" && len(credential.SSHPrivateKey) == 0
 }
 
 func sortReferences(references []Reference) {

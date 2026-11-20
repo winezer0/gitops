@@ -3,7 +3,6 @@ package gitops
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 )
 
@@ -87,8 +86,8 @@ func diagnosticForError(err error, phase string, repository Repository, ref stri
 		diagnostic.Retryable = true
 	case kind == ErrorUnsupported:
 		diagnostic.Code = "git_operation_unsupported"
-		diagnostic.Message = "The selected Git engine does not support this operation."
-		diagnostic.Recommendation = "Install system Git or use a supported transport and operation."
+		diagnostic.Message = "GitOps does not support the requested operation or configuration."
+		diagnostic.Recommendation = "Use a supported transport and operation."
 	case kind == ErrorResourceLimit:
 		diagnostic.Code = "git_resource_limit"
 		diagnostic.Message = "The Git operation exceeded a configured resource limit."
@@ -111,47 +110,4 @@ func errorKind(err error) ErrorKind {
 	}
 	kind, _ := classifyError(err)
 	return kind
-}
-
-func diagnosticFromCommandOutput(output []byte, err error) Diagnostic {
-	text := strings.ToLower(string(output))
-	diagnostic := diagnosticForError(err, "reference_lookup", Repository{}, "", 0, 0)
-	switch {
-	case strings.Contains(text, "host key verification failed"), strings.Contains(text, "remote host identification has changed"), strings.Contains(text, "host key has changed"):
-		diagnostic.Code, diagnostic.Phase = "git_ssh_host_key_rejected", "ssh_host_verification"
-		diagnostic.Message = "The SSH host fingerprint could not be verified."
-		diagnostic.Recommendation = "Verify the repository server fingerprint and update the known_hosts entry. Do not disable host key checking."
-		diagnostic.Retryable = false
-	case strings.Contains(text, "authentication"), strings.Contains(text, "permission denied"), strings.Contains(text, "access denied"), strings.Contains(text, "returned error: 401"), strings.Contains(text, "returned error: 403"):
-		diagnostic.Code, diagnostic.Phase = "credential_rejected", "authentication"
-		diagnostic.Message = "Repository credentials were rejected or do not grant read access."
-		diagnostic.Recommendation = "Check that the credential is current, has repository read permission, and is mapped to the exact Git host."
-		diagnostic.Retryable = false
-	case strings.Contains(text, "could not resolve host"), strings.Contains(text, "name or service not known"), strings.Contains(text, "no such host"):
-		diagnostic.Code, diagnostic.Phase = "git_host_dns_failed", "dns_lookup"
-		diagnostic.Message = "The repository host could not be resolved by DNS."
-		diagnostic.Recommendation = "Check the host name and DNS configuration available to the Git client."
-		diagnostic.Retryable = true
-	case strings.Contains(text, "certificate"), strings.Contains(text, "ssl error"), strings.Contains(text, "tls"), strings.Contains(text, "schannel"):
-		diagnostic.Code, diagnostic.Phase = "git_tls_failed", "tls_handshake"
-		diagnostic.Message = "The secure connection to the repository host failed certificate or TLS validation."
-		diagnostic.Recommendation = "Check the host certificate chain, server time, and TLS configuration."
-		diagnostic.Retryable = false
-	case strings.Contains(text, "proxy"), strings.Contains(text, "tunnel connection"):
-		diagnostic.Code, diagnostic.Phase = "git_proxy_failed", "proxy_connect"
-		diagnostic.Message = "The configured proxy could not connect to the repository host."
-		diagnostic.Recommendation = "Check the server proxy URL, credentials, and reachability."
-		diagnostic.Retryable = true
-	case strings.Contains(text, "failed to connect"), strings.Contains(text, "connection refused"), strings.Contains(text, "network is unreachable"), strings.Contains(text, "operation timed out"):
-		diagnostic.Code, diagnostic.Phase = "git_host_unreachable", "remote_connect"
-		diagnostic.Message = "The repository host could not be reached from the Git client."
-		diagnostic.Recommendation = "Check network routes, firewall rules, VPN access, and proxy configuration."
-		diagnostic.Retryable = true
-	case strings.Contains(text, "repository not found"), strings.Contains(text, "does not appear to be a git repository"), strings.Contains(text, "returned error: 404"):
-		diagnostic.Code, diagnostic.Phase = "repository_not_found", "repository_lookup"
-		diagnostic.Message = "Repository was not found or is not readable."
-		diagnostic.Recommendation = "Check the repository path and confirm that the configured credential has read access."
-		diagnostic.Retryable = false
-	}
-	return diagnostic
 }

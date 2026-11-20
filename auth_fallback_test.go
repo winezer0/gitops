@@ -6,20 +6,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestAuthenticationFailureDoesNotFallBackToGoGit(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("system Git is required to exercise the primary engine")
-	}
-
+func TestAuthenticationFailureIsNotRetried(t *testing.T) {
 	const username = "fallback-test-user"
 	const token = "fallback-test-secret"
 	var requests atomic.Int32
@@ -37,12 +30,7 @@ func TestAuthenticationFailureDoesNotFallBackToGoGit(t *testing.T) {
 	defer server.Close()
 
 	certificate := server.Certificate()
-	certificatePath := filepath.Join(t.TempDir(), "test-ca.pem")
 	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
-	if err := os.WriteFile(certificatePath, certificatePEM, 0o600); err != nil {
-		t.Fatal("failed to write temporary test CA certificate")
-	}
-	t.Setenv("GIT_SSL_CAINFO", certificatePath)
 	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
 	t.Setenv("no_proxy", "127.0.0.1,localhost")
 	t.Setenv("HTTP_PROXY", "")
@@ -60,6 +48,7 @@ func TestAuthenticationFailureDoesNotFallBackToGoGit(t *testing.T) {
 	client, err := NewClient(Config{
 		AllowedHosts: []string{repository.Host},
 		Timeout:      10 * time.Second,
+		CABundle:     certificatePEM,
 		CredentialFor: func(host string) (Credential, error) {
 			if host != repository.Host {
 				return Credential{}, ErrHostNotAllowed

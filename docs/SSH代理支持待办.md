@@ -2,7 +2,7 @@
 
 ## 状态
 
-暂未实现，按当前决定延期。GitOps 的 `ProxyFor` 目前用于 HTTP/HTTPS Git 操作和服务商凭证 API；SSH transport 不调用该代理回调。用户机器上的 OpenSSH 配置可能自行设置 `ProxyCommand`，但它不属于 GitOps 提供的统一能力，也不能保证 system Git 与 go-git 行为一致。
+暂未实现，按当前决定延期。GitOps 的 `ProxyFor` 目前用于 HTTP/HTTPS Git 操作和服务商凭证 API；内置 Go SSH transport 不调用该代理回调。SSH 代理能力需由 GitOps 显式提供并纳入连接和安全策略。
 
 ## 何时实施
 
@@ -11,7 +11,7 @@
 ## 设计约束
 
 - 新增独立的 SSH 代理配置，避免将 HTTPS Git 代理配置直接复用于 SSH。协议范围实施前明确，优先考虑 HTTP CONNECT、HTTPS CONNECT；是否包含 SOCKS5 另行确定。
-- 确保 system Git 和 go-git 两条执行路径行为一致。若只能由其中一条路径处理代理 SSH，必须明确路由策略，不能在另一条路径上静默退化为直连。
+- 为唯一的 Go SSH 执行路径定义代理配置和连接行为，不能在代理配置失败时静默退化为直连。
 - 在建立隧道前继续执行仓库主机 allowlist 和 SSRF 检查。隧道只负责网络转发，不得跳过严格的 SSH host-key 校验。
 - 代理凭证与 Git 仓库凭证分开管理，不得写入进程参数、诊断消息或进度事件；代理连接和 SSH 握手均须支持超时及取消。
 - 诊断应区分代理连接/认证失败、目标不可达、SSH 认证失败和 host-key 拒绝，并保持现有安全脱敏规则。
@@ -22,7 +22,7 @@
 - [`golang.org/x/net/proxy`](https://pkg.go.dev/golang.org/x/net/proxy)：可提供 SOCKS5 拨号能力；HTTP CONNECT 需要额外拨号器。
 - [`Psiphon upstreamproxy`](https://github.com/Psiphon-Labs/psiphon-tunnel-core/tree/master/psiphon/upstreamproxy)：支持多种代理认证，但模块较重且为 GPL-3.0，除非重新评估许可和依赖体积，否则不作为首选。
 
-当前 go-git v5 SSH transport 接受 `transport.ProxyOptions`，并通过 `x/net/proxy` 建立连接；system Git 则需要 SSH `ProxyCommand` 或其他隧道接入方式。[go-git v5.19.3 SSH 实现](https://github.com/go-git/go-git/blob/v5.19.3/plumbing/transport/ssh/common.go)。因此，仅给 go-git 增加 HTTP CONNECT 拨号器不足以完成 GitOps 的统一支持。
+当前 SSH transport 通过 Go SSH 库和 context-aware TCP 拨号建立连接。实现代理时应将代理连接器接入拨号阶段，并保留握手超时、取消、主机 allowlist 和严格 host-key 校验。
 
 ## 验收条件
 
