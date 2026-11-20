@@ -51,8 +51,21 @@ func TestLocalSSHDiscoveryResolvesAliasAndMultipleIdentityFiles(t *testing.T) {
 	if discovered.HostName != "code.example.test" || discovered.User != "deploy" || discovered.Port != "2222" {
 		t.Fatalf("SSH alias configuration = %#v", discovered)
 	}
-	if len(discovered.IdentityFiles) != 2 || discovered.IdentityFiles[0] != keyOne || discovered.IdentityFiles[1] != keyTwo {
-		t.Fatalf("SSH identity candidates = %#v", discovered.IdentityFiles)
+	if len(discovered.IdentityFiles) != 2 {
+		t.Fatalf("SSH identity candidates = %#v, want 2", discovered.IdentityFiles)
+	}
+	for i, want := range []string{keyOne, keyTwo} {
+		gotInfo, err := os.Stat(discovered.IdentityFiles[i])
+		if err != nil {
+			t.Fatalf("stat discovered SSH identity %q: %v", discovered.IdentityFiles[i], err)
+		}
+		wantInfo, err := os.Stat(want)
+		if err != nil {
+			t.Fatalf("stat expected SSH identity %q: %v", want, err)
+		}
+		if !os.SameFile(gotInfo, wantInfo) {
+			t.Errorf("SSH identity candidate %q does not identify expected file %q", discovered.IdentityFiles[i], want)
+		}
 	}
 	signers, err := loadSSHIdentitySigners(discovered.IdentityFiles, config)
 	if err != nil || len(signers) != 2 {
