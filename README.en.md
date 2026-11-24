@@ -69,6 +69,8 @@ Credentials are resolved in this order: the request's explicit credential, `Cred
 
 The Go engine verifies HTTPS certificates by default and requires an explicit SSH host-key trust source, such as configured `known_hosts` files or an application callback. Local SSH config and key discovery are opt-in through `DiscoverSSHKeys`. Do not put keys or tokens in repository URLs.
 
+To automatically support HTTPS URLs with locally configured SSH keys, enable `FallbackSSHOnHTTPSAuthFailure`. GitOps tries the original HTTPS URL first and only tries SSH for the same host and repository path after an authentication rejection when no HTTPS token or password is configured. The HTTPS port is not reused; SSH uses the local SSH configuration or port 22. Network, TLS, missing-repository, and invalid-reference failures do not trigger fallback. SSH remains subject to the host allowlist and host-key verification. Diagnostics report both attempt results and the SSH credential source without exposing key paths; an explicitly configured HTTPS token or password is never bypassed.
+
 A hostname-only entry in `AllowedHosts` permits custom ports on that host. An entry that includes a port restricts access to that port. Server applications should configure both `AllowedHosts` and `ValidateHost` to apply DNS and SSRF policies before repository, provider API, and submodule requests.
 
 System credential helpers are not supported. `Config.UseCredentialHelpers` remains for source compatibility and causes `NewClient` to return `ErrCredentialHelpersUnsupported` when enabled. Integrations should load credentials through a request or credential callback.

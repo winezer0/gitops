@@ -69,6 +69,8 @@ fmt.Printf("resolved commit: %s\n", result.ResolvedCommit)
 
 Go 引擎默认验证 HTTPS 证书，并要求显式配置 SSH 主机密钥信任来源，例如 `known_hosts` 文件或应用回调。本机 SSH 配置和密钥发现通过 `DiscoverSSHKeys` 显式启用。不要将密钥或令牌放进仓库 URL。
 
+需要自动兼容 HTTPS 地址和本机 SSH 密钥时，可启用 `FallbackSSHOnHTTPSAuthFailure`。GitOps 先尝试原 HTTPS 地址；仅在认证被拒绝且没有 HTTPS Token/密码时，才对同一主机和仓库路径尝试 SSH。HTTPS 端口不会沿用，SSH 端口使用 SSH 配置或默认端口 22。网络、TLS、仓库不存在或引用错误不会触发回退。SSH 仍须通过主机白名单和主机密钥校验；诊断会说明两次尝试结果和 SSH 凭证来源，但不会显示密钥路径。显式 HTTPS Token/密码认证失败时不会改用 SSH。
+
 `AllowedHosts` 中只写主机名时，允许该主机使用自定义端口；写入主机名和端口时，只允许该端口。服务端应用应同时配置 `AllowedHosts` 和 `ValidateHost`，以便在访问仓库、服务商 API 和子模块前应用 DNS 与 SSRF 安全策略。
 
 不支持系统凭证助手。保留 `Config.UseCredentialHelpers` 仅用于源码兼容；启用时 `NewClient` 会返回 `ErrCredentialHelpersUnsupported`。集成方应通过请求或凭证回调加载凭证。

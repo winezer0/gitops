@@ -139,7 +139,7 @@ func TestSSHDiscoveryIsOptInAndRevalidatesAliasTarget(t *testing.T) {
 
 func TestSSHDiscoveryRejectsUnsupportedRoutingDirectives(t *testing.T) {
 	_, sshDirectory := prepareSSHHome(t)
-	if err := os.WriteFile(filepath.Join(sshDirectory, "config"), []byte("Host *\n Include other.conf\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(sshDirectory, "config"), []byte("Host *\n ProxyJump bastion\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	repository, err := ParseURL("ssh://git.example.test/team/repo.git")
@@ -149,6 +149,142 @@ func TestSSHDiscoveryRejectsUnsupportedRoutingDirectives(t *testing.T) {
 	_, err = discoverSSHConfig(repository, Config{DiscoverSSHKeys: true, SSHConfigDir: sshDirectory})
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("unsupported SSH routing directive error = %v", err)
+	}
+}
+
+func TestSSHDiscoverySupportsIncludeAndMatchHostUser(t *testing.T) {
+	_, sshDirectory := prepareSSHHome(t)
+	if err := os.WriteFile(filepath.Join(sshDirectory, "config"), []byte("Include included.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDirectory, "included.conf"), []byte("Match host git-alias user git\n HostName matched.example.test\n Port 2222\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := ParseURL("ssh://git-alias/team/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := discoverSSHConfig(repo, Config{DiscoverSSHKeys: true, SSHConfigDir: sshDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HostName != "matched.example.test" || got.Port != "2222" {
+		t.Fatalf("discovered config = %#v", got)
+	}
+}
+
+func TestSSHConfigPatternListsSupportNegation(t *testing.T) {
+	for _, tc := range []struct {
+		patterns []string
+		value    string
+		want     bool
+	}{
+		{[]string{"*.example.test", "!blocked.example.test"}, "git.example.test", true},
+		{[]string{"*.example.test", "!blocked.example.test"}, "blocked.example.test", false},
+		{[]string{"!blocked.example.test"}, "git.example.test", false},
+	} {
+		if got := sshConfigPatternListMatches(tc.patterns, tc.value); got != tc.want {
+			t.Errorf("match %v against %q = %v, want %v", tc.patterns, tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestSSHDiscoveryMatchThenHostStartsNewSection(t *testing.T) {
+	_, dir := prepareSSHHome(t)
+	contents := "Match host does-not-match\n HostName ignored.example.test\nHost git-alias\n HostName selected.example.test\n"
+	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := ParseURL("ssh://git-alias/team/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := discoverSSHConfig(repo, Config{DiscoverSSHKeys: true, SSHConfigDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HostName != "selected.example.test" {
+		t.Fatalf("HostName = %q", got.HostName)
+	}
+}
+
+func TestSSHConfigIncludeRejectsCycleOutsideHomeAndFileLimit(t *testing.T) {
+	home := t.TempDir()
+	config := filepath.Join(home, "config")
+	if err := os.WriteFile(config, []byte("Include config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSSHConfig(config, home, "host", "user", 0, map[string]bool{}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("cycle error = %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.conf")
+	if err := os.WriteFile(outside, []byte("Host *\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSSHConfig(outside, home, "host", "user", 0, map[string]bool{}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("outside path error = %v", err)
+	}
+	limits := &sshConfigLoadLimits{files: maxSSHConfigFiles}
+	if _, err := loadSSHConfigLimited(config, home, "host", "user", 0, map[string]bool{}, limits); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("file limit error = %v", err)
+	}
+}
+
+func TestSSHConfigIncludeGlobOrderIsStable(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"02.conf": "HostName second.example.test\n", "01.conf": "HostName first.example.test\n"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	main := filepath.Join(dir, "config")
+	if err := os.WriteFile(main, []byte("Include *.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSSHConfig(main, home, "host", "user", 0, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Index(got, "first.example.test") > strings.Index(got, "second.example.test") {
+		t.Fatalf("include order = %q", got)
+	}
+}
+
+func TestSSHDiscoverySupportsQuotedIncludeAndMatchOriginalHostLocalUser(t *testing.T) {
+	_, sshDirectory := prepareSSHHome(t)
+	localUser, err := userpkgCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := fmt.Sprintf("Include \"with space.conf\"\n")
+	if err := os.WriteFile(filepath.Join(sshDirectory, "config"), []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	child := fmt.Sprintf("Match originalhost git-alias localuser \"%s\"\n HostName quoted.example.test\n", localUser)
+	if err := os.WriteFile(filepath.Join(sshDirectory, "with space.conf"), []byte(child), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := ParseURL("ssh://git-alias/team/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadSSHConfig(filepath.Join(sshDirectory, "config"), filepath.Dir(sshDirectory), "git-alias", "git", 0, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(loaded, "HostName quoted.example.test") {
+		t.Fatalf("loaded config = %q", loaded)
+	}
+	got, err := discoverSSHConfig(repo, Config{DiscoverSSHKeys: true, SSHConfigDir: sshDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HostName != "quoted.example.test" {
+		t.Fatalf("HostName = %q", got.HostName)
 	}
 }
 

@@ -57,6 +57,22 @@ func (client *Client) Probe(ctx context.Context, request ProbeRequest) (ProbeRes
 	}
 	result, err := (goGitEngine{config: client.config}).Probe(ctx, repository, request, credential, timeout, proxyURL)
 	if err != nil {
+		if client.shouldFallbackSSH(repository, credential, err) && ctx.Err() == nil {
+			sshRepository, sshCredential, fallbackErr := client.prepareSSHFallback(ctx, repository)
+			if fallbackErr == nil {
+				result, fallbackErr = (goGitEngine{config: client.config}).Probe(ctx, sshRepository, request, sshCredential, timeout, "")
+			}
+			if fallbackErr != nil {
+				err = fallbackFailure(err, fallbackErr, repository, request.Ref, timeout, time.Since(started))
+			} else {
+				err = nil
+				result.Repository = repository
+				diagnostic := fallbackSuccessDiagnostic(repository, result.ResolvedRef, timeout, time.Since(started), sshCredentialSource(client.config, sshCredential))
+				result.Diagnostic = &diagnostic
+			}
+		}
+	}
+	if err != nil {
 		return client.probeFailure(result, err, "reference_lookup", repository, request.Ref, timeout, started, request.OnEvent)
 	}
 	if result.Diagnostic == nil {
@@ -147,6 +163,28 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 		monitorResult <- monitorWorkspaceSize(monitorContext, staging, maxBytes, cancelClone)
 	}()
 	result, err := client.clone(cloneContext, repository, request, credential)
+	fallbackUsed := false
+	fallbackCredentialSource := ""
+	if err != nil && client.shouldFallbackSSH(repository, credential, err) && cloneContext.Err() == nil {
+		if clearErr := clearStagingDirectory(staging); clearErr != nil {
+			err = operationError(fmt.Errorf("prepare SSH retry workspace: %w", clearErr))
+		} else {
+			sshRepository, sshCredential, fallbackErr := client.prepareSSHFallback(cloneContext, repository)
+			if fallbackErr == nil {
+				result, fallbackErr = client.clone(cloneContext, sshRepository, request, sshCredential)
+			}
+			if fallbackErr != nil {
+				err = fallbackFailure(err, fallbackErr, repository, request.Ref, timeout, time.Since(started))
+			} else if restoreErr := restoreWorkspaceOrigin(staging, repository); restoreErr != nil {
+				err = operationError(restoreErr)
+			} else {
+				err = nil
+				fallbackUsed = true
+				fallbackCredentialSource = sshCredentialSource(client.config, sshCredential)
+				result.Repository = repository
+			}
+		}
+	}
 	if err == nil && request.RecurseSubmodules {
 		err = client.cloneSubmodules(cloneContext, request, repository, credential, staging)
 	}
@@ -174,6 +212,9 @@ func (client *Client) Clone(ctx context.Context, request CloneRequest) (cloneRes
 	}
 	result.Path = destination
 	diagnostic := Diagnostic{Code: "git_clone_succeeded", Phase: "checkout", Message: "Git repository was cloned successfully.", Host: repository.Host, Ref: result.ResolvedRef, Transport: repository.Transport, Duration: time.Since(started), Timeout: timeout}
+	if fallbackUsed {
+		diagnostic = fallbackSuccessDiagnostic(repository, result.ResolvedRef, timeout, time.Since(started), fallbackCredentialSource)
+	}
 	emitProgress(request.OnEvent, OperationEvent{Kind: EventDiagnostic, Operation: "clone", Engine: result.Engine, Diagnostic: &diagnostic})
 	return result, operationError(err)
 }

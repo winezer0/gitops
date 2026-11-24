@@ -17,10 +17,13 @@ func diagnosticForError(err error, phase string, repository Repository, ref stri
 	var operation *OperationError
 	if errors.As(err, &operation) && operation.Diagnostic != nil {
 		diagnostic := *operation.Diagnostic
-		diagnostic.Phase = phase
+		isFallbackDiagnostic := diagnostic.Code == "git_transport_fallback_failed"
+		if !isFallbackDiagnostic {
+			diagnostic.Phase = phase
+			diagnostic.Transport = repository.Transport
+		}
 		diagnostic.Host = limitedDiagnosticText(repository.Host, 255)
 		diagnostic.Ref = limitedDiagnosticText(ref, 256)
-		diagnostic.Transport = repository.Transport
 		diagnostic.Timeout = timeout
 		diagnostic.Duration = duration
 		return diagnostic

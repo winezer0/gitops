@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -57,14 +58,12 @@ func discoverSSHConfig(repository Repository, config Config) (discoveredSSHConfi
 	if err != nil {
 		return discoveredSSHConfig{}, fmt.Errorf("read SSH config: %w", err)
 	}
-	defer file.Close()
-	if err := rejectUnsupportedSSHDirectives(file); err != nil {
+	file.Close()
+	contents, err := loadSSHConfig(configPath, home, alias, firstNonEmpty(repositorySSHUser(repository.URL), "git"), 0, map[string]bool{})
+	if err != nil {
 		return discoveredSSHConfig{}, err
 	}
-	if _, err := file.Seek(0, 0); err != nil {
-		return discoveredSSHConfig{}, err
-	}
-	parsed, err := ssh_config.Decode(file)
+	parsed, err := ssh_config.Decode(strings.NewReader(contents))
 	if err != nil {
 		return discoveredSSHConfig{}, fmt.Errorf("parse SSH config: %w", err)
 	}
@@ -130,24 +129,247 @@ func sshAliasAndPort(raw string) (string, string, error) {
 	return host, "", nil
 }
 
-func rejectUnsupportedSSHDirectives(file *os.File) error {
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+const maxSSHConfigIncludeDepth = 8
+const maxSSHConfigFiles = 64
+const maxSSHConfigBytes = 1 << 20
+
+type sshConfigLoadLimits struct {
+	files int
+	bytes int
+}
+
+func loadSSHConfig(path, home, host, user string, depth int, active map[string]bool) (string, error) {
+	limits := &sshConfigLoadLimits{}
+	return loadSSHConfigLimited(path, home, host, user, depth, active, limits)
+}
+
+func loadSSHConfigLimited(path, home, host, user string, depth int, active map[string]bool, limits *sshConfigLoadLimits) (string, error) {
+	if depth > maxSSHConfigIncludeDepth {
+		return "", fmt.Errorf("%w: SSH config Include depth exceeded", ErrUnsupported)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if err := withinRoot(home, abs); err != nil {
+		return "", fmt.Errorf("%w: SSH config Include is outside user home", ErrUnsupported)
+	}
+	resolvedHome, rootErr := filepath.EvalSymlinks(home)
+	resolvedPath, pathErr := filepath.EvalSymlinks(abs)
+	if rootErr != nil || pathErr != nil || withinRoot(resolvedHome, resolvedPath) != nil {
+		return "", fmt.Errorf("%w: SSH config Include resolves outside user home", ErrUnsupported)
+	}
+	if active[resolvedPath] {
+		return "", fmt.Errorf("%w: SSH config Include cycle", ErrUnsupported)
+	}
+	active[resolvedPath] = true
+	defer delete(active, resolvedPath)
+	b, err := os.ReadFile(abs)
+	if err != nil {
+		return "", fmt.Errorf("read SSH config: %w", err)
+	}
+	limits.files++
+	limits.bytes += len(b)
+	if limits.files > maxSSHConfigFiles || limits.bytes > maxSSHConfigBytes {
+		return "", fmt.Errorf("%w: SSH config Include limits exceeded", ErrUnsupported)
+	}
+	var out strings.Builder
+	enabled := true
+	s := bufio.NewScanner(strings.NewReader(string(b)))
+	s.Buffer(make([]byte, 4096), maxSSHConfigBytes)
+	for s.Scan() {
+		line := s.Text()
+		trimmed := strings.TrimSpace(line)
+		fields, tokenErr := sshConfigFields(trimmed)
+		if tokenErr != nil {
+			return "", tokenErr
 		}
-		line = strings.ReplaceAll(line, "=", " ")
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		if len(fields) == 0 || strings.HasPrefix(trimmed, "#") {
+			if enabled {
+				out.WriteString(line + "\n")
+			}
 			continue
 		}
 		switch strings.ToLower(fields[0]) {
-		case "include", "match", "proxyjump", "proxycommand":
-			return fmt.Errorf("%w: SSH config directive %s", ErrUnsupported, fields[0])
+		case "host":
+			// Host begins a new section and must remain visible to ssh_config.Decode.
+			// A preceding Match condition no longer gates this Host section.
+			out.WriteString(line + "\n")
+			enabled = true
+		case "include":
+			if len(fields) < 2 {
+				return "", fmt.Errorf("invalid SSH config Include")
+			}
+			if enabled {
+				for _, pattern := range fields[1:] {
+					p := expandSSHConfigHome(strings.Trim(pattern, "\"'"), home)
+					if !filepath.IsAbs(p) {
+						p = filepath.Join(filepath.Dir(abs), p)
+					}
+					matches, e := filepath.Glob(p)
+					if e != nil {
+						return "", e
+					}
+					for _, m := range matches {
+						nested, e := loadSSHConfigLimited(m, home, host, user, depth+1, active, limits)
+						if e != nil {
+							return "", e
+						}
+						out.WriteString(nested)
+					}
+				}
+			}
+		case "match":
+			if len(fields) < 3 {
+				return "", fmt.Errorf("invalid SSH config Match")
+			}
+			ok := true
+			i := 1
+			for i < len(fields) {
+				key := strings.ToLower(fields[i])
+				if key == "all" {
+					i++
+					continue
+				}
+				if i+1 >= len(fields) {
+					return "", fmt.Errorf("invalid SSH config Match")
+				}
+				vals := strings.Split(fields[i+1], ",")
+				target := host
+				switch key {
+				case "user":
+					target = user
+				case "originalhost":
+					target = host
+				case "localuser":
+					current, e := userpkgCurrent()
+					if e != nil {
+						return "", e
+					}
+					target = current
+				case "host":
+				default:
+					return "", fmt.Errorf("%w: SSH config Match %s", ErrUnsupported, key)
+				}
+				matched := sshConfigPatternListMatches(vals, target)
+				if !matched {
+					ok = false
+				}
+				i += 2
+			}
+			enabled = ok
+		default:
+			if strings.EqualFold(fields[0], "proxyjump") || strings.EqualFold(fields[0], "proxycommand") {
+				return "", fmt.Errorf("%w: SSH config directive %s", ErrUnsupported, fields[0])
+			}
+			if enabled {
+				out.WriteString(line + "\n")
+			}
 		}
 	}
-	return scanner.Err()
+	if err := s.Err(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+// SSH config pattern lists are ORed; a matching negative pattern vetoes the list.
+func sshConfigPatternListMatches(patterns []string, value string) bool {
+	positive := false
+	for _, pattern := range patterns {
+		for _, item := range strings.Split(pattern, ",") {
+			negative := strings.HasPrefix(item, "!")
+			item = strings.TrimPrefix(item, "!")
+			matched, err := filepath.Match(strings.ToLower(item), strings.ToLower(value))
+			if err != nil {
+				continue
+			}
+			if matched && negative {
+				return false
+			}
+			if matched {
+				positive = true
+			}
+		}
+	}
+	return positive
+}
+
+func userpkgCurrent() (string, error) {
+	current, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return current.Username, nil
+}
+
+func sshConfigFields(line string) ([]string, error) {
+	var fields []string
+	var b strings.Builder
+	quote := rune(0)
+	escaped := false
+	started := false
+	for _, r := range line {
+		if escaped {
+			if r != ' ' && r != '\t' && r != '#' && r != '\\' && r != '"' && r != '\'' {
+				b.WriteRune('\\')
+			}
+			b.WriteRune(r)
+			escaped = false
+			started = true
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			// Preserve Windows path/user separators; only consume backslashes that
+			// escape syntax characters in a config token.
+			escaped = true
+			started = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				b.WriteRune(r)
+			}
+			started = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			started = true
+			continue
+		}
+		if r == '#' && !started {
+			break
+		}
+		if r == '=' {
+			if started {
+				fields = append(fields, b.String())
+				b.Reset()
+				started = false
+			}
+			continue
+		}
+		if r == ' ' || r == '\t' {
+			if started {
+				fields = append(fields, b.String())
+				b.Reset()
+				started = false
+			}
+			continue
+		}
+		b.WriteRune(r)
+		started = true
+	}
+	if escaped || quote != 0 {
+		return nil, fmt.Errorf("invalid quoting in SSH config")
+	}
+	if started {
+		fields = append(fields, b.String())
+	}
+	return fields, nil
 }
 
 func resolveSSHIdentityPath(value, home, alias, hostName, user, port string) (string, error) {

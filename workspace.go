@@ -59,6 +59,10 @@ func directorySize(root string) (int64, error) {
 }
 
 func monitorWorkspaceSize(ctx context.Context, root string, maximum int64, cancel context.CancelFunc) error {
+	if err := checkWorkspaceSize(ctx, root, maximum); err != nil {
+		cancel()
+		return err
+	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {

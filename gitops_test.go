@@ -292,7 +292,6 @@ func TestWorkspaceMonitorCancelsAtLimit(t *testing.T) {
 	go func() {
 		result <- monitorWorkspaceSize(monitorContext, root, 4, cancelOperation)
 	}()
-	time.Sleep(300 * time.Millisecond)
 	if err := os.WriteFile(filepath.Join(root, "large.bin"), []byte("12345"), 0o600); err != nil {
 		t.Fatal(err)
 	}

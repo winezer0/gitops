@@ -93,6 +93,8 @@ type Config struct {
 	// UseCredentialHelpers is retained for source compatibility. NewClient returns
 	// ErrCredentialHelpersUnsupported when it is enabled.
 	UseCredentialHelpers bool
+	// FallbackSSHOnHTTPSAuthFailure retries HTTPS authentication failures over SSH.
+	FallbackSSHOnHTTPSAuthFailure bool
 	// CredentialFor resolves credentials by host for compatibility. New code should
 	// use request credentials or CredentialForRepository.
 	CredentialFor func(host string) (Credential, error)
